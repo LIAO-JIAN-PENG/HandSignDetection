@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-import argparse
+
 import csv
 import time
 import copy
@@ -10,72 +10,13 @@ from collections import deque
 import cv2 as cv
 import numpy as np
 
+from utils.args import get_args
 from utils import CvFpsCalc
 from utils import CvDrawText
+from utils import audio_player
 from model.yolox.yolox_onnx import YoloxONNX
 
-
-def get_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--width", help='cap width', type=int, default=960)
-    parser.add_argument("--height", help='cap height', type=int, default=540)
-    parser.add_argument("--file", type=str, default=None)
-
-    parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("--skip_frame", type=int, default=0)
-
-    parser.add_argument(
-        "--model",
-        type=str,
-        default='model/yolox/yolox_nano.onnx',
-    )
-    parser.add_argument(
-        '--input_shape',
-        type=str,
-        default="416,416",
-        help="Specify an input shape for inference.",
-    )
-    parser.add_argument(
-        '--score_th',
-        type=float,
-        default=0.7,
-        help='Class confidence',
-    )
-    parser.add_argument(
-        '--nms_th',
-        type=float,
-        default=0.45,
-        help='NMS IoU threshold',
-    )
-    parser.add_argument(
-        '--nms_score_th',
-        type=float,
-        default=0.1,
-        help='NMS Score threshold',
-    )
-    parser.add_argument(
-        "--with_p6",
-        action="store_true",
-        help="Whether your model uses p6 in FPN/PAN.",
-    )
-
-    parser.add_argument("--sign_interval", type=float, default=2.0)
-    parser.add_argument("--jutsu_display_time", type=int, default=5)
-
-    parser.add_argument("--use_display_score", type=bool, default=False)
-    parser.add_argument("--erase_bbox", type=bool, default=False)
-    parser.add_argument("--use_jutsu_lang_en", type=bool, default=False)
-
-    parser.add_argument("--chattering_check", type=int, default=1)
-
-    parser.add_argument("--use_fullscreen", type=bool, default=False)
-
-    args = parser.parse_args()
-
-    return args
-
+import os
 
 def main():
     # 引数解析 #################################################################
@@ -108,12 +49,12 @@ def main():
 
     use_fullscreen = args.use_fullscreen
 
-    # カメラ準備 ###############################################################
+    # Camera 準備 ###############################################################
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    # モデル読み込み ############################################################
+    # Yolox 模型 ############################################################
     yolox = YoloxONNX(
         model_path=model_path,
         input_shape=input_shape,
@@ -121,30 +62,36 @@ def main():
         nms_th=nms_th,
         nms_score_th=nms_score_th,
         with_p6=with_p6,
-        # providers=['CPUExecutionProvider'],
+        providers=['CUDAExecutionProvider'],
     )
 
-    # FPS計測モジュール #########################################################
+    # FPS 計算 #########################################################
     cvFpsCalc = CvFpsCalc()
 
-    # フォント読み込み ##########################################################
+    # 字體 ##########################################################
     # https://opentype.jp/kouzanmouhitufont.htm
     font_path = './utils/font/衡山毛筆フォント.ttf'
 
-    # ラベル読み込み ###########################################################
+    # 結印 & 術式 設定 ###########################################################
     with open('setting/labels.csv', encoding='utf8') as f:  # 印
         labels = csv.reader(f)
         labels = [row for row in labels]
+    
+    # TODO: 順序亂掉，暫時這樣
+    # seq = [0, 10, 12, 13, 11, 5, 4, 7, 15, 9, 2, 8, 14, 1, 6, 3, 16]
+    # labels = [labels[i] for i in seq]
+    
 
     with open('setting/jutsu.csv', encoding='utf8') as f:  # 術
         jutsu = csv.reader(f)
         jutsu = [row for row in jutsu]
 
-    # 印の表示履歴および、検出履歴 ##############################################
+    # 印的停留時間及歷史留存 ##############################################
     sign_max_display = 18
     sign_max_history = 44
     sign_display_queue = deque(maxlen=sign_max_display)
     sign_history_queue = deque(maxlen=sign_max_history)
+    effect_images_queue = deque()
 
     chattering_check_queue = deque(maxlen=chattering_check)
     for index in range(-1, -1 - chattering_check, -1):
@@ -167,6 +114,10 @@ def main():
     if use_fullscreen:
         cv.namedWindow(window_name, cv.WINDOW_NORMAL)
 
+    # 限制 yolo 讀取太快(等待楨數), stable list 至少存放 stable_time 次的相同內結印
+    stable_time = 16
+    stable_list = list()
+    
     while True:
         start_time = time.time()
 
@@ -175,6 +126,7 @@ def main():
         if not ret:
             continue
         frame_count += 1
+        frame = cv.flip(frame, 1)
         debug_image = copy.deepcopy(frame)
 
         if (frame_count % (skip_frame + 1)) != 0:
@@ -185,6 +137,8 @@ def main():
 
         # 検出実施 #############################################################
         bboxes, scores, class_ids = yolox.inference(frame)
+
+        # print(bboxes, scores, class_ids)
 
         # 検出内容の履歴追加 ####################################################
         for _, score, class_id in zip(bboxes, scores, class_ids):
@@ -200,17 +154,26 @@ def main():
                 continue
 
             # 前回と異なる印の場合のみキューに登録
-            if len(sign_display_queue
-                   ) == 0 or sign_display_queue[-1] != class_id:
-                sign_display_queue.append(class_id)
-                sign_history_queue.append(class_id)
-                sign_interval_start = time.time()  # 印の最終検出時間
+            if len(sign_display_queue) == 0 or sign_display_queue[-1] != class_id:
+                stable_list.append(class_id)
+
+            # 穩定串列
+            if len(stable_list) > 0 and stable_list[-1] == class_id:
+                stable_list.append(class_id)
+
+                if len(stable_list) == stable_time:
+                    sign_display_queue.append(class_id)
+                    sign_history_queue.append(class_id)
+                    sign_interval_start = time.time()
+                    stable_list.clear()
+                
+              # 印の最終検出時間
 
         # 前回の印検出から指定時間が経過した場合、履歴を消去 ####################
         if (time.time() - sign_interval_start) > sign_interval:
             sign_display_queue.clear()
             sign_history_queue.clear()
-
+        
         # 術成立判定 #########################################################
         jutsu_index, jutsu_start_time = check_jutsu(
             sign_history_queue,
@@ -242,6 +205,7 @@ def main():
             use_display_score,
             jutsu,
             sign_display_queue,
+            effect_images_queue,
             sign_max_display,
             jutsu_display_time,
             jutsu_font_size_ratio,
@@ -298,6 +262,7 @@ def draw_debug_image(
     use_display_score,
     jutsu,
     sign_display_queue,
+    effect_images_queue, 
     sign_max_display,
     jutsu_display_time,
     jutsu_font_size_ratio,
@@ -306,20 +271,23 @@ def draw_debug_image(
     jutsu_start_time,
 ):
     frame_width, frame_height = debug_image.shape[1], debug_image.shape[0]
+    center_x, center_y = debug_image.shape[1]//2, debug_image.shape[0]//2
+    square_len = 200
+    square_y1 = debug_image.shape[0]//2
 
-    # 印のバウンディングボックスの重畳表示(表示オプション有効時) ###################
+    # 是否要印上結印框框 ###################
     if not erase_bbox:
         for bbox, score, class_id in zip(bboxes, scores, class_ids):
             class_id = int(class_id) + 1
 
-            # 検出閾値未満のバウンディングボックスは捨てる
+            # 分數的閥值
             if score < score_th:
                 continue
 
             x1, y1 = int(bbox[0]), int(bbox[1])
             x2, y2 = int(bbox[2]), int(bbox[3])
 
-            # バウンディングボックス(長い辺にあわせて正方形を表示)
+            # 顯示正方形框框
             x_len = x2 - x1
             y_len = y2 - y1
             square_len = x_len if x_len >= y_len else y_len
@@ -327,19 +295,28 @@ def draw_debug_image(
             square_y1 = int(((y1 + y2) / 2) - (square_len / 2))
             square_x2 = square_x1 + square_len
             square_y2 = square_y1 + square_len
-            cv.rectangle(debug_image, (square_x1, square_y1),
-                         (square_x2, square_y2), (255, 255, 255), 4)
-            cv.rectangle(debug_image, (square_x1, square_y1),
-                         (square_x2, square_y2), (0, 0, 0), 2)
 
-            # 印の種類
-            font_size = int(square_len / 2)
-            debug_image = CvDrawText.puttext(
-                debug_image, labels[class_id][1],
-                (square_x2 - font_size, square_y2 - font_size), font_path,
-                font_size, (185, 0, 0))
+            # 特效取 center
+            center_x = int((square_x2 + square_x1)/2)
+            center_y = int((square_y2 + square_y1)/2)
+            
+            # cv.circle(debug_image,(center_x, center_y), 3, (0, 255, 255), 3)
+            # cv.circle(debug_image,(center_x, square_y1), 3, (0, 255, 0), 3)
 
-            # 検出スコア(表示オプション有効時)
+            if len(effect_images_queue) == 0:
+                cv.rectangle(debug_image, (square_x1, square_y1),
+                            (square_x2, square_y2), (255, 255, 255), 4)
+                cv.rectangle(debug_image, (square_x1, square_y1),
+                            (square_x2, square_y2), (0, 0, 0), 2)
+
+            # 結印的顯示    
+                font_size = int(square_len / 2)
+                debug_image = CvDrawText.puttext(
+                    debug_image, labels[class_id][1],
+                    (square_x2 - font_size, square_y2 - font_size), font_path,
+                    font_size, (185, 0, 0))
+
+            # 是否顯示分數
             if use_display_score:
                 font_size = int(square_len / 8)
                 debug_image = CvDrawText.puttext(
@@ -348,20 +325,43 @@ def draw_debug_image(
                      square_y1 + int(font_size / 4)), font_path, font_size,
                     (185, 0, 0))
 
-    # ヘッダー作成：FPS #########################################################
+    # 上欄位的顯示：FPS #########################################################
     header_image = np.zeros((int(frame_height / 18), frame_width, 3), np.uint8)
     header_image = CvDrawText.puttext(header_image, "FPS:" + str(fps_result),
                                       (5, 0), font_path,
                                       int(frame_height / 20), (255, 255, 255))
 
-    # フッター作成：印の履歴、および、術名表示 ####################################
+    # 下欄位的顯示：結印紀錄、結印、術式名稱 ####################################
     footer_image = np.zeros((int(frame_height / 10), frame_width, 3), np.uint8)
 
-    # 印の履歴文字列生成
+    # 結印紀錄
     sign_display = ''
     if len(sign_display_queue) > 0:
         for sign_id in sign_display_queue:
             sign_display = sign_display + labels[sign_id][1]
+    
+    # TODO: 術式特效
+    if len(effect_images_queue) > 0:
+        filename = effect_images_queue.popleft()
+
+        effect_image = cv.imread(f'effect/{jutsu[jutsu_index][3]}/{filename}')
+        
+        center = (0, 0)
+        size = (debug_image.shape[1], debug_image.shape[0])
+        
+        if int(jutsu[jutsu_index][1]) == 0:
+            center = (debug_image.shape[1]//2, debug_image.shape[0]//2)
+        elif int(jutsu[jutsu_index][1]) == 1:
+            center = (center_x, center_y)
+            size = (square_len, square_len)
+            if jutsu[jutsu_index][3] == 'rasen_shuriken':
+                size = (square_len*5, square_len*5)
+
+        elif int(jutsu[jutsu_index][1]) == 2:
+            center = (center_x, square_y1)
+            size = (800, 800)
+        
+        debug_image = img_paste(debug_image, effect_image, size, center)
 
     # 術名表示(指定時間描画)
     if lang_offset == 0:
@@ -374,6 +374,14 @@ def draw_debug_image(
         else:  # 属性(火遁等)の定義が有る場合
             jutsu_string = jutsu[jutsu_index][0 + lang_offset] + \
                 separate_string + jutsu[jutsu_index][2 + lang_offset]
+        
+        if len(effect_images_queue) == 0 and time.time()-jutsu_start_time < 0.1:
+            if os.path.exists(f'./effect/{jutsu[jutsu_index][3]}'):
+                effect_images_queue += deque(os.listdir(f'./effect/{jutsu[jutsu_index][3]}'))
+
+            if os.path.exists(f'./audio/{jutsu[jutsu_index][3]}.mp3'):
+                audio_player.audioPlay(jutsu[jutsu_index][3])
+
         footer_image = CvDrawText.puttext(
             footer_image, jutsu_string, (5, 0), font_path,
             int(frame_width / jutsu_font_size_ratio), (255, 255, 255))
@@ -390,6 +398,36 @@ def draw_debug_image(
 
     return debug_image
 
+def img_paste(src_img, pas_img, size, center):
+    '''
+        Function: 將目標 pas_img 貼在 src_img 上
+        Parameter:
+            src_img: 底層圖片
+            pas_img: 貼上的圖片
+            size: 貼上改為大小 size 的 pas_img
+            center: 貼上 pas_img 的中心點對準的位置 
+    '''
+    # 貼上的圖片位移(方法: 建一個更大的黑色背景，然後位移)
+    filter_min_intensity = 35
+    back_max_length = 2500
+    src_height, src_width = src_img.shape[:2]
+
+    back = np.zeros((back_max_length, back_max_length, 3), dtype='uint8')
+    pas_img = cv.resize(pas_img, size)
+    back[:size[1], :size[0]] = pas_img
+    H = np.float32([[1, 0, center[0]-size[0]//2], [0, 1, center[1]-size[1]//2]])
+    back = cv.warpAffine(back, H, (src_width, src_height))
+    
+    # 去背
+    minblack = np.array([0, 0, 0])
+    maxblack = np.array([filter_min_intensity, filter_min_intensity, filter_min_intensity])
+    mask = cv.inRange(back, minblack, maxblack)
+    mask_not = cv.bitwise_not(mask)
+    back = cv.bitwise_and(back, back, mask=mask_not)
+    # 使用 mask 會讓貼上的圖片清楚，但也會有黑邊問題
+    # src_img = cv.bitwise_and(src_img, src_img, mask=mask)
+
+    return cv.addWeighted(src_img, 0.5, back, 1, 1)
 
 if __name__ == '__main__':
     main()

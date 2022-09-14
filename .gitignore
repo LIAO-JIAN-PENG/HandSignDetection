@@ -133,3 +133,9 @@ dmypy.json
 
 # mp4
 *.mp4
+
+# mp3
+*.mp3
+
+# image
+*.jpg
